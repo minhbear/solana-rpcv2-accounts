@@ -20,33 +20,176 @@
 
 ---
 
-## 1) High‑level Architecture
+## 1) System Data Flow Architecture
 
-### ASCII (fallback)
+### 1.1 Complete System Data Flow (Producer/Consumer Pattern)
 
 ```
-Validators (>=2)
-   │         ┌──────────────────────────┐
-   ├─Geyser──► 1) Ingest + Dedupe       │
-   │         └────────────┬─────────────┘
-   │                      │  CDC Events
-   │         ┌────────────▼─────────────┐
-   │         │ 2) CDC Log / Event Bus   │
-   │         └───────┬──────────┬───────┘
-   │                 │          │
-   │     ┌───────────▼───┐  ┌───▼─────────────────┐
-   │     │ 3A) State KV  │  │ 3B) Index Builders  │
-   │     │ (current acct)│  │  (SPL-Token, GPA)   │
-   │     │ Scylla/Rocks  │  │  → ClickHouse       │
-   │     └───────┬───────┘  └────────┬────────────┘
-   │             │                   │
-   │   ┌─────────▼─────────┐   ┌─────▼─────────────┐
-   │   │ 4) RPC HTTP       │   │ 5) WS Gateway     │
-   │   │ (axum)            │   │ (resume tokens)   │
-   │   └────────┬──────────┘   └────────┬──────────┘
-   │            │                       │
-   └────────────▼───────────────────────▼─────────────► Clients
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                                   SOLANA RPC v2 ACCOUNTS SYSTEM                         │
+└─────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│ Validator 1 │    │ Validator 2 │    │ Validator N │
+│ Yellowstone │    │ Yellowstone │    │ Yellowstone │
+│ gRPC Stream │    │ gRPC Stream │    │ gRPC Stream │
+└──────┬──────┘    └──────┬──────┘    └──────┬──────┘
+       │                  │                  │
+       │ AccountUpdate    │ AccountUpdate    │ AccountUpdate
+       │ SlotUpdate       │ SlotUpdate       │ SlotUpdate  
+       │                  │                  │
+       └────────┬─────────┴─────────┬────────┘
+                │                   │
+                ▼                   ▼
+        ┌─────────────────────────────────────────┐
+        │         🏭 PRODUCER                     │
+        │    ingest-geyser/ (Rust Service)        │
+        │                                         │
+        │  • Dedupe & Normalize Events            │
+        │  • Fork Detection (bank_hash)           │
+        │  • Commitment Watermark Tracking        │
+        │  • Rate Limiting & Backpressure         │
+        └─────────────────┬───────────────────────┘
+                          │
+                          │ Publish AccountChange Events
+                          ▼
+        ┌─────────────────────────────────────────┐
+        │         🚌 EVENT BUS                    │
+        │    Kafka/Redpanda (Message Queue)       │
+        │                                         │
+        │  Topic: "account-changes"               │
+        │  Partitions: 32 (hash by pubkey)        │
+        │  Retention: 72 hours (replay buffer)    │
+        │  Replication: 3x for durability         │
+        └─────┬─────────────┬─────────────┬───────┘
+              │             │             │
+              │             │             │ Subscribe to Events
+              ▼             ▼             ▼
+    ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
+    │ 📤 CONSUMER │ │ 📤 CONSUMER │ │ 📤 CONSUMER │
+    │ State-KV    │ │ Index       │ │ WebSocket   │
+    │ Materializer│ │ Builder     │ │ Gateway     │
+    └─────┬───────┘ └─────┬───────┘ └─────┬───────┘
+          │               │               │
+          │ Write         │ Write         │ Stream
+          │ Current       │ Program       │ Real-time
+          │ State         │ Indexes       │ Updates
+          ▼               ▼               ▼
+  ┌───────────────┐ ┌───────────────┐ ┌───────────────┐
+  │ 🗄️ STORAGE    │ │ 🗄️ STORAGE    │ │ 🌐 LIVE       │
+  │               │ │               │ │               │
+  │ ScyllaDB      │ │ ClickHouse    │ │ WebSocket     │
+  │ (Hot State)   │ │ (Indexes)     │ │ Connections   │
+  │               │ │               │ │               │
+  │ • Current     │ │ • SPL Token   │ │ • Account     │
+  │   Account     │ │   Accounts    │ │   Subscriptions│
+  │   State       │ │ • Mints       │ │ • Program     │
+  │ • Versioning  │ │ • GPA Index   │ │   Subscriptions│
+  │ • Fork Data   │ │ • Stake Accts │ │ • Resume      │
+  │               │ │ • Custom      │ │   Tokens      │
+  └───────┬───────┘ └───────┬───────┘ └───────┬───────┘
+          │                 │                 │
+          │ Redis Cache     │                 │
+          │ (Hot Keys)      │                 │
+          ▼                 │                 │
+  ┌───────────────┐         │                 │
+  │ Redis         │         │                 │
+  │ (Optional)    │         │                 │
+  │ • Most Freq   │         │                 │
+  │   Accounts    │         │                 │
+  │ • 5min TTL    │         │                 │
+  └───────┬───────┘         │                 │
+          │                 │                 │
+          └────────┬────────┘                 │
+                   │                          │
+                   ▼                          │
+        ┌─────────────────────────────────────┐│
+        │         🚀 SERVING LAYER            ││
+        │    rpc-http/ (axum/hyper)           ││
+        │                                     ││
+        │  JSON-RPC Endpoints:                ││
+        │  • getAccountInfo                   ││
+        │  • getMultipleAccounts              ││
+        │  • getProgramAccounts               ││
+        │  • getTokenAccountsByOwner          ││
+        │  • getLargestTokenAccounts          ││
+        │  • simulateTransaction              ││
+        │                                     ││
+        │  Features:                          ││
+        │  • Adaptive Batching                ││
+        │  • Filter Validation                ││
+        │  • Rate Limiting                    ││
+        │  • Circuit Breakers                 ││
+        └─────────────────┬───────────────────┘│
+                          │                    │
+                          │ HTTP Response      │ WebSocket Messages
+                          ▼                    ▼
+        ┌─────────────────────────────────────────┐
+        │              👥 CLIENTS                 │
+        │                                         │
+        │  • dApps (React/Vue/Angular)           │
+        │  • Backend Services (Node/Python)      │
+        │  • Trading Bots                        │
+        │  • Analytics Platforms                 │
+        │  • Mobile Apps                         │
+        │  • Other RPC Providers                 │
+        └─────────────────────────────────────────┘
 ```
+
+### 1.2 Data Flow Summary
+1. **Validators** stream account updates via Yellowstone gRPC
+2. **Geyser Producer** normalizes, dedupes, and publishes to Event Bus
+3. **Event Bus (Kafka)** durably stores events with ordering guarantees
+4. **Multiple Consumers** subscribe and process events independently:
+   - **State-KV Consumer** → writes current account state to ScyllaDB/Redis
+   - **Index Builder** → extracts program data and writes to ClickHouse
+   - **WebSocket Gateway** → streams live updates to subscribed clients
+5. **RPC Server** reads from storage layers to serve JSON-RPC requests
+6. **Clients** receive both HTTP responses and WebSocket updates
+
+### 1.3 Producer/Consumer Architecture Explained
+
+**KEY CLARIFICATION:** This is **Event Streaming Architecture**, NOT traditional database Change Data Capture (CDC).
+
+```
+SINGLE PRODUCER PATTERN:
+┌─────────────────────────────────────────┐
+│ ingest-geyser/ (Producer Service)       │
+│                                         │
+│ Responsibilities:                       │
+│ • Connect to multiple Geyser streams   │
+│ • Normalize account updates             │
+│ • Deduplicate events                    │
+│ • Publish to Kafka topic                │
+│                                         │
+│ Topic: "account-changes"                │
+│ Key: pubkey (for ordering)              │
+│ Value: AccountChange struct             │
+└─────────────────────────────────────────┘
+
+MULTIPLE CONSUMER PATTERN:
+┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+│ state-kv/       │  │ index-ch/       │  │ ws-gateway/     │
+│ (Consumer)      │  │ (Consumer)      │  │ (Consumer)      │
+│                 │  │                 │  │                 │
+│ Subscribes to:  │  │ Subscribes to:  │  │ Subscribes to:  │
+│ account-changes │  │ account-changes │  │ account-changes │
+│                 │  │                 │  │                 │
+│ Processes:      │  │ Processes:      │  │ Processes:      │
+│ • Write to      │  │ • Parse account │  │ • Stream to WS  │
+│   ScyllaDB      │  │   data          │  │   clients       │
+│ • Cache in      │  │ • Extract       │  │ • Handle        │
+│   Redis         │  │   program fields│  │   subscriptions │
+│                 │  │ • Write to CH   │  │                 │
+└─────────────────┘  └─────────────────┘  └─────────────────┘
+```
+
+**Benefits of This Pattern:**
+- **Decoupling:** Each service can be deployed, scaled, and updated independently
+- **Reliability:** If one consumer fails, others continue working
+- **Replay:** Kafka retention allows consumers to replay missed events
+- **Fan-out:** One stream of data feeds multiple specialized consumers
+- **Ordering:** Kafka partitioning ensures per-account event ordering
 
 ---
 
@@ -55,12 +198,12 @@ Validators (>=2)
 ```
 rpcv2-accounts/
   crates/
-    ingest-geyser/         # Yellowstone gRPC client, normalizer, dedupe
-    cdc-bus/               # Kafka/Redpanda or NATS JetStream producers/consumers
-    state-kv/              # ScyllaDB client or sharded RocksDB KV
-    index-ch/              # ClickHouse writers, query pushdown for GPA/Token
+    ingest-geyser/         # Yellowstone gRPC client, normalizer, dedupe (PRODUCER)
+    event-bus/             # Kafka/Redpanda or NATS JetStream producers/consumers
+    state-kv/              # ScyllaDB client or sharded RocksDB KV (CONSUMER)
+    index-ch/              # ClickHouse writers, query pushdown for GPA/Token (CONSUMER)
     rpc-http/              # JSON-RPC server (axum), batching & filter validation
-    ws-gateway/            # WebSocket server (resume tokens, dedupe, overflow)
+    ws-gateway/            # WebSocket server (resume tokens, dedupe, overflow) (CONSUMER)
     simulate/              # simulateTransaction (Phase 1 delegate, Phase 2 bank)
     conformance/           # wire-compat, correctness, commitment semantics
     bench/                 # load & latency harness, WS reliability tests
@@ -107,16 +250,35 @@ pub struct CommitmentWatermarks {
 
 ---
 
-### 3.2 `cdc-bus/` — Durable Event Log
-**Purpose:** Decouple ingestion from serving; allow replay and fan‑out.
+### 3.2 `event-bus/` — Event Streaming & Message Queue
+**Purpose:** Decouple ingestion from serving; enable replay, fan‑out, and independent scaling.
 
-- **Option A: Redpanda / Kafka** — partitions, retention, exactly‑once-ish with idempotent writes.
-- **Option B: NATS JetStream** — simpler ops; at‑least‑once; lower latency; good for WS.
+**Architecture Pattern:** **Producer/Consumer with Event Streaming** (NOT traditional database CDC)
+- **Option A: Redpanda / Kafka** — high throughput, partitions, retention, exactly‑once-ish with idempotent writes.
+- **Option B: NATS JetStream** — simpler ops; at‑least‑once; lower latency; good for WebSocket streaming.
 
-**Why a CDC log?**  
-- Recover from crashes by replay.  
-- Multiple consumers (materializers, WS, backfillers) scale independently.  
-- Stable ordering via `(slot, write_version)` within a partitioning strategy (e.g., hash(pubkey) to minimize cross‑partition reorders).
+**Why Event Bus Pattern?**  
+- **Recover from crashes** by replaying events from the message queue.
+- **Multiple consumers** (State-KV, Index Builder, WebSocket Gateway) scale independently.  
+- **Stable ordering** via `(slot, write_version, transaction_index)` within partitioning strategy (hash by pubkey).
+- **Durability:** Events persist for 72 hours, enabling crash recovery and debugging.
+
+**Technical Implementation:**
+```rust
+// Producer (ingest-geyser)
+kafka_producer.send(
+    FutureRecord::to("account-changes")
+        .key(&event.pubkey.to_string())
+        .payload(&event.serialize()),
+).await?;
+
+// Consumers (state-kv, index-ch, ws-gateway)  
+kafka_consumer.subscribe(&["account-changes"])?;
+while let Some(message) = kafka_consumer.recv().await {
+    let event: AccountChange = deserialize(message.payload())?;
+    // Each consumer processes the same events differently
+}
+```
 
 ---
 
